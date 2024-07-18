@@ -7,14 +7,10 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"os"
 
+	"github.com/confluentinc/confluent-kafka-go/kafka"
 	"gocloud.dev/pubsub"
-	_ "gocloud.dev/pubsub/awssnssqs"
-	_ "gocloud.dev/pubsub/azuresb"
-	_ "gocloud.dev/pubsub/gcppubsub"
-	_ "gocloud.dev/pubsub/kafkapubsub"
-	_ "gocloud.dev/pubsub/natspubsub"
-	_ "gocloud.dev/pubsub/rabbitpubsub"
 
 	"github.com/luraproject/lura/v2/config"
 	"github.com/luraproject/lura/v2/logging"
@@ -56,13 +52,7 @@ func (f *BackendFactory) New(remote *config.Backend) proxy.Proxy {
 }
 
 func (f *BackendFactory) initPublisher(ctx context.Context, remote *config.Backend) (proxy.Proxy, error) {
-	if len(remote.Host) < 1 {
-		return proxy.NoopProxy, errNoBackendHostDefined
-	}
-
-	dns := remote.Host[0]
 	cfg := &publisherCfg{}
-
 	if err := getConfig(remote, publisherNamespace, cfg); err != nil {
 		if _, ok := err.(*NamespaceNotFoundErr); !ok {
 			f.logger.Error(fmt.Sprintf("[BACKEND][PubSub] Error initializing publisher: %s", err.Error()))
@@ -70,18 +60,35 @@ func (f *BackendFactory) initPublisher(ctx context.Context, remote *config.Backe
 		return proxy.NoopProxy, err
 	}
 
-	logPrefix := "[BACKEND: " + dns + cfg.TopicURL + "][PubSub]"
-	t, err := pubsub.OpenTopic(ctx, dns+cfg.TopicURL)
-	if err != nil {
-		f.logger.Error(fmt.Sprintf(logPrefix, err.Error()))
-		return proxy.NoopProxy, err
+	logPrefix := "[BACKEND: " + cfg.Topic_url + "][PubSub]"
+	kafka_brokers := os.Getenv("KAFKA_BROKERS")
+	if kafka_brokers == "" {
+		f.logger.Error(fmt.Sprintf("[BACKEND][PubSub] Error initializing publisher: the KAFKA_BROKERS environment variable dose not exist"))
+		return proxy.NoopProxy, &KafkaBrokerEmpyErr{}
+	}
+
+	p, err0 := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": kafka_brokers, "delivery.timeout.ms": 3000})
+	if err0 != nil {
+		f.logger.Error(fmt.Sprintf("[BACKEND][PubSub] Error initializing publisher: %s", err0.Error()))
+		return proxy.NoopProxy, err0
 	}
 
 	f.logger.Debug(logPrefix, "Publisher initialized sucessfully")
 
 	go func() {
 		<-ctx.Done()
-		t.Shutdown(context.Background())
+		p.Close()
+	}()
+
+	go func() {
+		for e := range p.Events() {
+			switch ev := e.(type) {
+			case *kafka.Message:
+				if ev.TopicPartition.Error != nil {
+					f.logger.Error(fmt.Sprintf("[BACKEND][PubSub] Failed to deliver message: %v\n", ev.TopicPartition.Error))
+				}
+			}
+		}
 	}()
 
 	return func(ctx context.Context, r *proxy.Request) (*proxy.Response, error) {
@@ -89,28 +96,27 @@ func (f *BackendFactory) initPublisher(ctx context.Context, remote *config.Backe
 		if err != nil {
 			return nil, err
 		}
-		headers := map[string]string{}
-		for k, vs := range r.Headers {
-			headers[k] = vs[0]
-		}
-		msg := &pubsub.Message{
-			Metadata: headers,
-			Body:     body,
-		}
+		headers := []kafka.Header{}
 
-		if err := t.Send(ctx, msg); err != nil {
-			return nil, err
+		for k, vs := range r.Headers {
+			kh := kafka.Header{}
+			kh.Key = k
+			kh.Value = []byte(vs[0])
+			headers = append(headers, kh)
 		}
+		topic := cfg.Topic_url
+		p.Produce(&kafka.Message{
+			TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
+			Value:          []byte(body),
+			Headers:        headers,
+		}, nil)
+
 		return &proxy.Response{IsComplete: true}, nil
 	}, nil
 }
 
 func (f *BackendFactory) initSubscriber(ctx context.Context, remote *config.Backend) (proxy.Proxy, error) {
-	if len(remote.Host) < 1 {
-		return proxy.NoopProxy, errNoBackendHostDefined
-	}
 
-	dns := remote.Host[0]
 	cfg := &subscriberCfg{}
 
 	if err := getConfig(remote, subscriberNamespace, cfg); err != nil {
@@ -120,10 +126,19 @@ func (f *BackendFactory) initSubscriber(ctx context.Context, remote *config.Back
 		return proxy.NoopProxy, err
 	}
 
-	topicURL := dns + cfg.SubscriptionURL
-	logPrefix := "[BACKEND: " + topicURL + "][PubSub]"
+	kafka_brokers := os.Getenv("KAFKA_BROKERS")
+	if kafka_brokers == "" {
+		f.logger.Error(fmt.Sprintf("[BACKEND][PubSub] Error initializing subscriber: the KAFKA_BROKERS environment variable dose not exist"))
+		return proxy.NoopProxy, &KafkaBrokerEmpyErr{}
+	}
 
-	sub, err := pubsub.OpenSubscription(ctx, topicURL)
+	logPrefix := "[BACKEND: " + cfg.Subscription_url + "][PubSub]"
+
+	c, err := kafka.NewConsumer(&kafka.ConfigMap{
+		"bootstrap.servers": kafka_brokers,
+		"group.id":          cfg.Group_id,
+	})
+
 	if err != nil {
 		f.logger.Error(fmt.Sprintf(logPrefix, "Error while opening subscription: %s", err.Error()))
 		return proxy.NoopProxy, err
@@ -133,25 +148,22 @@ func (f *BackendFactory) initSubscriber(ctx context.Context, remote *config.Back
 
 	go func() {
 		<-ctx.Done()
-		sub.Shutdown(context.Background())
+		c.Close()
 	}()
 
 	ef := proxy.NewEntityFormatter(remote)
 
 	return func(ctx context.Context, _ *proxy.Request) (*proxy.Response, error) {
-		msg, err := sub.Receive(ctx)
+		msg, err := c.ReadMessage(-1)
 		if err != nil {
 			return nil, err
 		}
 
 		var data map[string]interface{}
-		if err := remote.Decoder(bytes.NewBuffer(msg.Body), &data); err != nil && err != io.EOF {
+		if err := remote.Decoder(bytes.NewBuffer(msg.Value), &data); err != nil && err != io.EOF {
 			// TODO: figure out how to Nack if possible
-			// msg.Nack()
 			return nil, err
 		}
-
-		msg.Ack()
 
 		newResponse := proxy.Response{Data: data, IsComplete: true}
 		newResponse = ef.Format(newResponse)
@@ -160,26 +172,30 @@ func (f *BackendFactory) initSubscriber(ctx context.Context, remote *config.Back
 }
 
 type publisherCfg struct {
-	TopicURL string `json:"topic_url"`
+	Topic_url string
+	// Addresses string
 }
 
 type subscriberCfg struct {
-	SubscriptionURL string `json:"subscription_url"`
+	Subscription_url string
+	// Addresses        string
+	Group_id string
 }
 
 func getConfig(remote *config.Backend, namespace string, v interface{}) error {
-	cfg, ok := remote.ExtraConfig[namespace]
+	data, ok := remote.ExtraConfig[namespace]
 	if !ok {
 		return &NamespaceNotFoundErr{
 			Namespace: namespace,
 		}
 	}
 
-	b, err := json.Marshal(&cfg)
+	raw, err := json.Marshal(data)
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(b, &v)
+
+	return json.Unmarshal(raw, &v)
 }
 
 type NamespaceNotFoundErr struct {
@@ -188,4 +204,11 @@ type NamespaceNotFoundErr struct {
 
 func (n *NamespaceNotFoundErr) Error() string {
 	return n.Namespace + " not found in the extra config"
+}
+
+type KafkaBrokerEmpyErr struct {
+}
+
+func (n *KafkaBrokerEmpyErr) Error() string {
+	return "The 'KAFKA_BROKERS' environment variable dose not exist!"
 }
