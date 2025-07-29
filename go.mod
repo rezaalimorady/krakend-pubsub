@@ -1,6 +1,6 @@
 module github.com/krakendio/krakend-pubsub/v2
 
-go 1.22
+go 1.23
 
 require (
 	github.com/confluentinc/confluent-kafka-go v1.8.2
